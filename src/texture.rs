@@ -17,16 +17,34 @@ use windows::{
     Win32::Graphics::{Direct3D10::*, Dxgi::Common::*},
 };
 
-struct Texture {
+struct ManagedTexture {
     tex: ID3D10Texture2D,
     srv: ID3D10ShaderResourceView,
     pixels: Vec<Color32>,
     width: usize,
 }
 
+enum Texture {
+    /// A texture managed by egui (created from ImageData)
+    Managed(ManagedTexture),
+    /// A user-provided texture (registered from an existing shader resource view)
+    User { srv: ID3D10ShaderResourceView },
+}
+
+impl Texture {
+    pub fn is_managed(&self) -> bool {
+        matches!(self, Texture::Managed(_))
+    }
+
+    pub fn is_user(&self) -> bool {
+        matches!(self, Texture::User { .. })
+    }
+}
+
 pub struct TexturePool {
     device: ID3D10Device,
     pool: HashMap<TextureId, Texture>,
+    next_user_texture_id: u64,
 }
 
 impl TexturePool {
@@ -34,11 +52,40 @@ impl TexturePool {
         Self {
             device: device.clone(),
             pool: HashMap::new(),
+            next_user_texture_id: 0,
         }
     }
 
     pub fn get_srv(&self, tid: TextureId) -> Option<ID3D10ShaderResourceView> {
-        self.pool.get(&tid).map(|t| t.srv.clone())
+        self.pool.get(&tid).map(|t| match t {
+            Texture::Managed(managed) => managed.srv.clone(),
+            Texture::User { srv } => srv.clone(),
+        })
+    }
+
+    /// Register a user-provided shader resource view and get a TextureId for it.
+    /// This TextureId can be used in egui to reference this texture.
+    ///
+    /// The returned TextureId will be unique and won't conflict with egui's managed textures.
+    pub fn register_user_texture(
+        &mut self,
+        srv: ID3D10ShaderResourceView,
+    ) -> TextureId {
+        let id = TextureId::User(self.next_user_texture_id);
+        self.next_user_texture_id += 1;
+        self.pool.insert(id, Texture::User { srv });
+        id
+    }
+
+    /// Unregister a user texture by its TextureId.
+    /// Returns true if the texture was found and removed, false otherwise.
+    pub fn unregister_user_texture(&mut self, tid: TextureId) -> bool {
+        if self.pool.get(&tid).is_some_and(|t| t.is_user()) {
+            self.pool.remove(&tid);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn update(
@@ -53,11 +100,13 @@ impl TexturePool {
             {
                 self.pool.insert(
                     tid,
-                    Self::create_texture(&self.device, delta.image)?,
+                    Self::create_managed_texture(&self.device, delta.image)?,
                 );
                 // the old texture is returned and dropped here, freeing
                 // all its gpu resource.
-            } else if let Some(tex) = self.pool.get_mut(&tid) {
+            } else if let Some(tex) =
+                self.pool.get_mut(&tid).filter(|t| t.is_managed())
+            {
                 Self::update_partial(
                     ctx,
                     tex,
@@ -65,11 +114,15 @@ impl TexturePool {
                     delta.pos.unwrap(),
                 )?;
             } else {
-                log::warn!("egui wants to update a non-existing texture {tid:?}. this request will be ignored.");
+                log::warn!(
+                    "egui wants to update a non-existing texture {tid:?}. this request will be ignored."
+                );
             }
         }
         for tid in delta.free {
-            self.pool.remove(&tid);
+            if self.pool.get(&tid).is_some_and(|t| t.is_managed()) {
+                self.pool.remove(&tid);
+            }
         }
         Ok(())
     }
@@ -80,8 +133,15 @@ impl TexturePool {
         image: ImageData,
         [nx, ny]: [usize; 2],
     ) -> Result<()> {
+        let Texture::Managed(old) = old else {
+            log::warn!(
+                "attempted to partially update a user texture, which is not supported"
+            );
+            return Ok(());
+        };
+
         match image {
-            ImageData::Font(f) => {
+            ImageData::Color(f) => {
                 let row_pitch = old.width * 4; // 4 bytes per pixel
                 let mut update_data = vec![0u8; f.height() * row_pitch];
 
@@ -91,17 +151,11 @@ impl TexturePool {
                         let whole = (ny + y) * old.width + nx + x;
                         let dst_idx = y * row_pitch + x * 4;
 
-                        // Create new Color32 and update old.pixels
-                        let new_color = Color32::from_rgba_premultiplied(
-                            255,
-                            255,
-                            255,
-                            (f.pixels[frac] * 255.) as u8,
-                        );
-                        old.pixels[whole] = new_color;
+                        // Update old.pixels
+                        old.pixels[whole] = f.pixels[frac];
 
                         // Update update_data
-                        let color_array = new_color.to_array();
+                        let color_array = f.pixels[frac].to_array();
                         update_data[dst_idx..dst_idx + 4]
                             .copy_from_slice(&color_array);
                     }
@@ -127,12 +181,11 @@ impl TexturePool {
                     );
                 }
             },
-            _ => unreachable!(),
         }
         Ok(())
     }
 
-    fn create_texture(
+    fn create_managed_texture(
         device: &ID3D10Device,
         data: ImageData,
     ) -> Result<Texture> {
@@ -140,18 +193,6 @@ impl TexturePool {
 
         let pixels = match &data {
             ImageData::Color(c) => c.pixels.clone(),
-            ImageData::Font(f) => f
-                .pixels
-                .iter()
-                .map(|a| {
-                    Color32::from_rgba_premultiplied(
-                        255,
-                        255,
-                        255,
-                        (a * 255.) as u8,
-                    )
-                })
-                .collect(),
         };
 
         let desc = D3D10_TEXTURE2D_DESC {
@@ -159,7 +200,7 @@ impl TexturePool {
             Height: data.height() as _,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -183,11 +224,11 @@ impl TexturePool {
         unsafe { device.CreateShaderResourceView(&tex, None, Some(&mut srv)) }?;
         let srv = srv.unwrap();
 
-        Ok(Texture {
+        Ok(Texture::Managed(ManagedTexture {
             tex,
             srv,
             width,
             pixels,
-        })
+        }))
     }
 }

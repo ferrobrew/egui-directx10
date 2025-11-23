@@ -16,9 +16,6 @@
 //! other Direct3D10 bindings is not recommended and may result in unexpected
 //! behavior.
 //!
-//! This crate is in early development. It should work in most cases but may
-//! lack certain features or functionalities.
-//!
 //! To get started, you can check the [`Renderer`] struct provided by this
 //! crate. You can also take a look at the [`egui-demo`](https://github.com/Nekomaru-PKU/egui-directx10/blob/main/examples/egui-demo.rs) example, which demonstrates all you need to do to set up a minimal application
 //! with Direct3D10 and `egui`. This example uses `winit` for window management
@@ -34,8 +31,8 @@ const fn zeroed<T>() -> T {
 }
 
 use egui::{
-    epaint::{textures::TexturesDelta, ClippedShape, Primitive, Vertex},
-    ClippedPrimitive, Pos2, Rgba,
+    ClippedPrimitive, Pos2,
+    epaint::{ClippedShape, Primitive, Vertex, textures::TexturesDelta},
 };
 
 use windows::{
@@ -79,12 +76,18 @@ pub struct RendererOutput {
 
 /// Convenience method to split a [`egui::FullOutput`] into the
 /// [`RendererOutput`] part and other parts for platform integration.
+///
+/// The returned tuple should be destructured as:
+/// ```ignore
+/// let (renderer_output, platform_output, viewport_output) =
+///     egui_directx10::split_output(full_output);
+/// ```
 pub fn split_output(
     full_output: egui::FullOutput,
 ) -> (
     RendererOutput,
     egui::PlatformOutput,
-    egui::ViewportIdMap<egui::ViewportOutput>,
+    egui::OrderedViewportIdMap<egui::ViewportOutput>,
 ) {
     (
         RendererOutput {
@@ -101,7 +104,7 @@ pub fn split_output(
 struct VertexData {
     pos: Pos2,
     uv: Pos2,
-    color: Rgba,
+    color: [f32; 4],
 }
 
 struct MeshData {
@@ -119,7 +122,7 @@ impl Renderer {
     /// If any Direct3D resource creation fails, this function will return an
     /// error. You can create the Direct3D10 device with debug layer enabled
     /// to find out details on the error.
-    pub fn new(device: &ID3D10Device, gamma_output: bool) -> Result<Self> {
+    pub fn new(device: &ID3D10Device) -> Result<Self> {
         let mut input_layout = None;
         let mut vertex_shader = None;
         let mut pixel_shader = None;
@@ -135,11 +138,7 @@ impl Renderer {
             device
                 .CreateVertexShader(Self::VS_BLOB, Some(&mut vertex_shader))?;
             device.CreatePixelShader(
-                if gamma_output {
-                    Self::PS_GAMMA_BLOB
-                } else {
-                    Self::PS_LINEAR_BLOB
-                },
+                Self::PS_BLOB,
                 Some(&mut pixel_shader),
             )?;
             device.CreateRasterizerState(
@@ -165,9 +164,53 @@ impl Renderer {
         })
     }
 
-    /// Render the output of `egui` to the provided render target using the
-    /// provided device context. The render target should use a linear color
-    /// space (e.g. `DXGI_FORMAT_R8G8B8A8_UNORM_SRGB`) for proper results.
+    /// Register a user-provided `ID3D10ShaderResourceView` and get a [`egui::TextureId`] for it.
+    ///
+    /// This allows you to use your own DirectX10 textures within egui. The returned
+    /// [`egui::TextureId`] can be used with [`egui::Image`], [`egui::ImageButton`], or
+    /// any other egui widget that accepts a texture ID.
+    ///
+    /// The texture will remain registered until you call [`Renderer::unregister_user_texture`]
+    /// or the [`Renderer`] is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Assuming you have a ID3D10ShaderResourceView
+    /// let texture_id = renderer.register_user_texture(my_srv);
+    ///
+    /// // Use it in egui
+    /// ui.image(egui::ImageSource::Texture(egui::load::SizedTexture::new(
+    ///     texture_id,
+    ///     egui::vec2(256.0, 256.0),
+    /// )));
+    /// ```
+    pub fn register_user_texture(
+        &mut self,
+        srv: ID3D10ShaderResourceView,
+    ) -> egui::TextureId {
+        self.texture_pool.register_user_texture(srv)
+    }
+
+    /// Unregister a user texture by its [`egui::TextureId`].
+    ///
+    /// Returns `true` if the texture was found and removed, `false` otherwise.
+    /// Note that this only works for user-registered textures, not textures
+    /// managed by egui itself.
+    pub fn unregister_user_texture(&mut self, tid: egui::TextureId) -> bool {
+        self.texture_pool.unregister_user_texture(tid)
+    }
+
+    /// Render the output of `egui` to the provided `render_target`.
+    ///
+    /// As `egui` requires color blending in gamma space, **the provided
+    /// `render_target` MUST be in the gamma color space and viewed as
+    /// non-sRGB-aware** (i.e. do NOT use `_SRGB` format in the texture and
+    /// the view).
+    ///
+    /// If you have to render to a render target in linear color space or
+    /// one that is sRGB-aware, you must create an intermediate render target
+    /// in gamma color space and perform a blit operation afterwards.
     ///
     /// The `scale_factor` should be the scale factor of your window and not
     /// confused with [`egui::Context::zoom_factor`]. If you are using `winit`,
@@ -199,16 +242,12 @@ impl Renderer {
     /// + The current shader, shader resource slot 0 and sampler slot 0 in the
     ///   pixel shader stage;
     /// + The render target(s) and blend state in the output merger stage;
-    ///
-    /// See the [`egui-demo`](https://github.com/Nekomaru-PKU/egui-directx10/blob/main/examples/egui-demo.rs)
-    /// example for code examples.
     pub fn render(
         &mut self,
         device_context: &ID3D10Device,
         render_target: &ID3D10RenderTargetView,
         egui_ctx: &egui::Context,
         egui_output: RendererOutput,
-        scale_factor: f32,
     ) -> Result<()> {
         self.texture_pool
             .update(device_context, egui_output.textures_delta)?;
@@ -219,8 +258,8 @@ impl Renderer {
 
         let frame_size = Self::get_render_target_size(render_target)?;
         let frame_size_scaled = (
-            frame_size.0 as f32 / scale_factor,
-            frame_size.1 as f32 / scale_factor,
+            frame_size.0 as f32 / egui_output.pixels_per_point,
+            frame_size.1 as f32 / egui_output.pixels_per_point,
         );
         let zoom_factor = egui_ctx.zoom_factor();
 
@@ -263,12 +302,19 @@ impl Renderer {
                                     * 2.0,
                             ),
                             uv,
-                            color: color.into(),
+                            color: [
+                                color[0] as f32 / 255.0,
+                                color[1] as f32 / 255.0,
+                                color[2] as f32 / 255.0,
+                                color[3] as f32 / 255.0,
+                            ],
                         })
                         .collect(),
                     idx: mesh.indices,
                     tex: mesh.texture_id,
-                    clip_rect: clip_rect * scale_factor * zoom_factor,
+                    clip_rect: clip_rect
+                        * egui_output.pixels_per_point
+                        * zoom_factor,
                 })
             });
         for mesh in meshes {
@@ -352,11 +398,8 @@ impl Renderer {
 }
 
 impl Renderer {
-    const VS_BLOB: &'static [u8] = include_bytes!("../shaders/egui_vs.bin");
-    const PS_LINEAR_BLOB: &'static [u8] =
-        include_bytes!("../shaders/egui_ps_linear.bin");
-    const PS_GAMMA_BLOB: &'static [u8] =
-        include_bytes!("../shaders/egui_ps_gamma.bin");
+    const VS_BLOB: &'static [u8] = include_bytes!("../shaders/vs_egui.bin");
+    const PS_BLOB: &'static [u8] = include_bytes!("../shaders/ps_egui.bin");
 
     const INPUT_ELEMENTS_DESC: [D3D10_INPUT_ELEMENT_DESC; 3] = [
         D3D10_INPUT_ELEMENT_DESC {
@@ -408,7 +451,7 @@ impl Renderer {
         AddressW: D3D10_TEXTURE_ADDRESS_BORDER,
         ComparisonFunc: D3D10_COMPARISON_ALWAYS,
         BorderColor: [1., 1., 1., 1.],
-        ..self::zeroed()
+        ..zeroed()
     };
 
     const BLEND_DESC: D3D10_BLEND_DESC = D3D10_BLEND_DESC {
@@ -423,21 +466,21 @@ impl Renderer {
             BOOL(0),
             BOOL(0),
         ],
-        SrcBlend: D3D10_BLEND_SRC_ALPHA,
+        SrcBlend: D3D10_BLEND_ONE,
         DestBlend: D3D10_BLEND_INV_SRC_ALPHA,
         BlendOp: D3D10_BLEND_OP_ADD,
-        SrcBlendAlpha: D3D10_BLEND_ONE,
-        DestBlendAlpha: D3D10_BLEND_ZERO,
+        SrcBlendAlpha: D3D10_BLEND_INV_DEST_ALPHA,
+        DestBlendAlpha: D3D10_BLEND_ONE,
         BlendOpAlpha: D3D10_BLEND_OP_ADD,
         RenderTargetWriteMask: [
             D3D10_COLOR_WRITE_ENABLE_ALL.0 as _,
-            self::zeroed(),
-            self::zeroed(),
-            self::zeroed(),
-            self::zeroed(),
-            self::zeroed(),
-            self::zeroed(),
-            self::zeroed(),
+            zeroed(),
+            zeroed(),
+            zeroed(),
+            zeroed(),
+            zeroed(),
+            zeroed(),
+            zeroed(),
         ],
     };
 }
@@ -493,7 +536,7 @@ impl Renderer {
         rtv: &ID3D10RenderTargetView,
     ) -> Result<(u32, u32)> {
         let tex = unsafe { rtv.GetResource() }?.cast::<ID3D10Texture2D>()?;
-        let mut desc = self::zeroed();
+        let mut desc = zeroed();
         unsafe { tex.GetDesc(&mut desc) };
         Ok((desc.Width, desc.Height))
     }
