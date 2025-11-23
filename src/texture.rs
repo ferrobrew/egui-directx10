@@ -142,7 +142,7 @@ impl TexturePool {
 
         match image {
             ImageData::Color(f) => {
-                let row_pitch = old.width * 4; // 4 bytes per pixel
+                let row_pitch = f.width() * 4; // 4 bytes per pixel
                 let mut update_data = vec![0u8; f.height() * row_pitch];
 
                 for y in 0..f.height() {

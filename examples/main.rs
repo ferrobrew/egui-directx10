@@ -5,7 +5,6 @@ use egui::*;
 use windows::Win32::{
     Foundation::{HMODULE, HWND},
     Graphics::{
-        Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0},
         Direct3D10::*,
         Dxgi::{Common::*, *},
     },
@@ -206,12 +205,12 @@ impl DemoApp {
         unsafe {
             D3D10CreateDevice(
                 &dxgi_adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
+                D3D10_DRIVER_TYPE_HARDWARE,
                 HMODULE(ptr::null_mut()),
                 if cfg!(debug_assertions) {
-                    D3D10_CREATE_DEVICE_DEBUG
+                    D3D10_CREATE_DEVICE_DEBUG.0 as u32
                 } else {
-                    D3D10_CREATE_DEVICE_FLAG(0)
+                    D3D10_CREATE_DEVICE_FLAG(0).0 as u32
                 },
                 D3D10_SDK_VERSION,
                 Some(&mut device),

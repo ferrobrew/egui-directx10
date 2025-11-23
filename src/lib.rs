@@ -36,9 +36,9 @@ use egui::{
 };
 
 use windows::{
-    core::{Interface, Result},
+    core::{Interface, Result, BOOL},
     Win32::{
-        Foundation::{BOOL, RECT},
+        Foundation::RECT,
         Graphics::{Direct3D::*, Direct3D10::*, Dxgi::Common::*},
     },
 };
@@ -371,7 +371,7 @@ impl Renderer {
                 Some(&(mem::size_of::<VertexData>() as _)),
                 Some(&0),
             );
-            device_context.IASetIndexBuffer(&ib, DXGI_FORMAT_R32_UINT, 0);
+            device_context.IASetIndexBuffer(&ib.clone(), DXGI_FORMAT_R32_UINT, 0);
             device_context.RSSetScissorRects(Some(&[RECT {
                 left: mesh.clip_rect.left() as _,
                 top: mesh.clip_rect.top() as _,
@@ -381,7 +381,7 @@ impl Renderer {
         }
         if let Some(srv) = texture_pool.get_srv(mesh.tex) {
             unsafe {
-                device_context.PSSetShaderResources(0, Some(&[Some(srv)]))
+                device_context.PSSetShaderResources(0, Some(&[Some(srv.clone())]))
             };
         } else {
             log::warn!(
@@ -449,9 +449,12 @@ impl Renderer {
         AddressU: D3D10_TEXTURE_ADDRESS_BORDER,
         AddressV: D3D10_TEXTURE_ADDRESS_BORDER,
         AddressW: D3D10_TEXTURE_ADDRESS_BORDER,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
         ComparisonFunc: D3D10_COMPARISON_ALWAYS,
         BorderColor: [1., 1., 1., 1.],
-        ..zeroed()
+        MinLOD: 0.0,
+        MaxLOD: f32::MAX,
     };
 
     const BLEND_DESC: D3D10_BLEND_DESC = D3D10_BLEND_DESC {
